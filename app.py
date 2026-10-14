@@ -69,20 +69,26 @@ def _video_id(url: str) -> str | None:
 
 
 def _ytdlp_json(url: str) -> dict:
-    """Video metadata (title, duration, subtitle tracks). Never downloads."""
-    p = _run(
-        [
-            "yt-dlp",
-            "--no-download",
-            "--dump-json",
-            "--no-playlist",
-            url,
-        ],
-        timeout=180,
-    )
-    if p.returncode != 0:
-        raise RuntimeError("Could not read that video: " + (p.stderr.strip()[-300:] or "unknown error"))
-    return json.loads(p.stdout)
+    """Video metadata (title, duration, subtitle tracks). Never downloads.
+
+    YouTube 403-blocks many datacenter IPs on the default web client, so
+    retry with the Android and iOS player clients, which are usually allowed.
+    """
+    last_err = ""
+    for client in (None, "android", "ios"):
+        cmd = ["yt-dlp", "--no-download", "--dump-json", "--no-playlist"]
+        if client:
+            cmd += ["--extractor-args", f"youtube:player_client={client}"]
+        cmd.append(url)
+        p = _run(cmd, timeout=180)
+        if p.returncode == 0:
+            try:
+                return json.loads(p.stdout)
+            except Exception:
+                last_err = "bad metadata response"
+                continue
+        last_err = p.stderr.strip()[-300:] or "unknown error"
+    raise RuntimeError("Could not read that video: " + last_err)
 
 
 def _subtitles_text(info: dict) -> str:
@@ -216,8 +222,11 @@ def _do_extract(job_id: str, req: ExtractRequest):
         # Download the video file first with yt-dlp's native downloader
         # (retries/resumes through flaky networks), then extract frames
         # locally. Streaming straight into ffmpeg dies on throttled links.
-        p = _run(
-            [
+        # Try each player client; datacenter IPs get 403 on some of them.
+        downloaded = False
+        dl_err = ""
+        for client in (None, "android", "ios"):
+            cmd = [
                 "yt-dlp",
                 "--no-playlist",
                 "--no-part",
@@ -229,14 +238,17 @@ def _do_extract(job_id: str, req: ExtractRequest):
                 "bv*[height<=480]/b[height<=480]/bv*/b",
                 "-o",
                 video_path,
-                req.url,
-            ],
-            timeout=1500,
-        )
-        if p.returncode != 0 or not os.path.isfile(video_path):
-            raise RuntimeError(
-                "Video download failed: " + (p.stderr.strip()[-300:] or "unknown error")
-            )
+            ]
+            if client:
+                cmd += ["--extractor-args", f"youtube:player_client={client}"]
+            cmd.append(req.url)
+            p = _run(cmd, timeout=1500)
+            if p.returncode == 0 and os.path.isfile(video_path):
+                downloaded = True
+                break
+            dl_err = p.stderr.strip()[-300:] or "unknown error"
+        if not downloaded:
+            raise RuntimeError("Video download failed: " + dl_err)
 
         manifest["status"] = "extracting"
         _write_manifest(job_dir, manifest)
