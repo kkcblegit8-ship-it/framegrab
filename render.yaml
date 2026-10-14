@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: framegrab
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATA_DIR
+        value: /tmp/framegrab-data
+      - key: SERVICE_KEY
+        sync: false
+      - key: PUBLIC_BASE
+        sync: false
