@@ -76,7 +76,8 @@ def _ytdlp_json(url: str) -> dict:
     """
     last_err = ""
     for client in (None, "android", "ios"):
-        cmd = ["yt-dlp", "--no-download", "--dump-json", "--no-playlist"]
+        cmd = ["yt-dlp", "--no-download", "--dump-json", "--no-playlist",
+               "--impersonate", "chrome"]
         if client:
             cmd += ["--extractor-args", f"youtube:player_client={client}"]
         cmd.append(url)
@@ -230,6 +231,8 @@ def _do_extract(job_id: str, req: ExtractRequest):
                 "yt-dlp",
                 "--no-playlist",
                 "--no-part",
+                "--impersonate",
+                "chrome",
                 "--retries",
                 "10",
                 "--fragment-retries",
