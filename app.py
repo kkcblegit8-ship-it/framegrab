@@ -29,6 +29,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
@@ -45,6 +46,15 @@ UPLOAD_TOKEN_TTL = 600
 CONTACT_SHEET_FRAMES = 144
 
 app = FastAPI(title="FrameGrab")
+# Joel's browser uploads video files straight to /api/upload, so the
+# website's origin must be allowed.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://robloxflow.vercel.app"],
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["*"],
+    max_age=3600,
+)
 _extract_lock = threading.Lock()
 _upload_tokens: dict[str, float] = {}  # token -> expiry timestamp
 
