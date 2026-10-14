@@ -28,7 +28,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
@@ -39,15 +39,19 @@ os.makedirs(JOBS_DIR, exist_ok=True)
 SERVICE_KEY = os.environ.get("SERVICE_KEY", "")
 JOB_TTL_SECONDS = 12 * 3600
 MAX_DURATION_SEC = 1800
-MAX_FRAMES = 900
+MAX_FRAMES = 5000
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+UPLOAD_TOKEN_TTL = 600
+CONTACT_SHEET_FRAMES = 144
 
 app = FastAPI(title="FrameGrab")
 _extract_lock = threading.Lock()
+_upload_tokens: dict[str, float] = {}  # token -> expiry timestamp
 
 
 class ExtractRequest(BaseModel):
     url: str = Field(min_length=8, max_length=500)
-    fps: float = Field(default=1.0, ge=0.25, le=2.0)
+    fps: float = Field(default=1.0, ge=0.25, le=5.0)
     maxFrames: int = Field(default=600, ge=10, le=MAX_FRAMES)
     width: int = Field(default=640, ge=320, le=854)
     startSec: float = Field(default=0, ge=0)
@@ -176,7 +180,157 @@ def _read_manifest(job_dir: str) -> dict | None:
         return json.load(f)
 
 
+def _probe_duration(video_path: str) -> float:
+    p = _run(
+        [
+            "ffprobe",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            video_path,
+        ],
+        timeout=60,
+    )
+    try:
+        return float(p.stdout.strip())
+    except Exception:
+        return 0
+
+
+def _extract_frames_from_file(
+    job_dir: str,
+    manifest: dict,
+    video_path: str,
+    title: str,
+    fps: float,
+    max_frames: int,
+    width: int,
+    start_sec: float,
+    end_sec: float,
+):
+    """Shared frame extraction from a local video file. Updates manifest."""
+    duration = _probe_duration(video_path)
+    if duration <= 0:
+        raise RuntimeError("Could not read the video length.")
+    if duration > MAX_DURATION_SEC:
+        raise RuntimeError(f"Video is too long ({duration:.0f}s). Max is {MAX_DURATION_SEC}s.")
+
+    start = min(start_sec, duration - 1)
+    end = end_sec if end_sec > start else duration
+    clip = min(end - start, max_frames / fps)
+    end = start + clip
+    frame_count = max(1, min(max_frames, int(clip * fps)))
+
+    manifest.update(
+        {
+            "status": "extracting",
+            "title": title,
+            "durationSec": round(duration, 1),
+            "clipStartSec": round(start, 1),
+            "clipEndSec": round(end, 1),
+            "fps": fps,
+            "frameCount": frame_count,
+            "width": width,
+        }
+    )
+    _write_manifest(job_dir, manifest)
+
+    p = _run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            str(start),
+            "-i",
+            video_path,
+            "-t",
+            str(clip),
+            "-vf",
+            f"fps={fps},scale={width}:-1",
+            "-frames:v",
+            str(frame_count),
+            "-q:v",
+            "4",
+            os.path.join(job_dir, "frame_%04d.jpg"),
+            "-y",
+        ],
+        timeout=1500,
+    )
+    # The video file is no longer needed; frames are what we keep.
+    try:
+        os.remove(video_path)
+    except OSError:
+        pass
+    if p.returncode != 0:
+        raise RuntimeError("Frame extraction failed: " + (p.stderr.strip()[-300:] or "ffmpeg error"))
+
+    actual = len([f for f in os.listdir(job_dir) if re.fullmatch(r"frame_\d+\.jpg", f)])
+    if actual == 0:
+        raise RuntimeError("No frames came out of that video.")
+
+    # Contact sheet: 6 columns from the first frames, keeps the agent's
+    # round trips low. Capped so 5k-frame jobs don't build a giant image.
+    sheet_n = min(actual, CONTACT_SHEET_FRAMES)
+    cols = 6
+    rows = max(1, (sheet_n + cols - 1) // cols)
+    if sheet_n < actual:
+        # Build the sheet from evenly sampled frames across the whole job.
+        import math
+
+        step = actual / sheet_n
+        sheet_dir = os.path.join(job_dir, "sheet")
+        os.makedirs(sheet_dir, exist_ok=True)
+        for i in range(sheet_n):
+            src = os.path.join(job_dir, f"frame_{int(i * step) + 1:04d}.jpg")
+            dst = os.path.join(sheet_dir, f"frame_{i + 1:04d}.jpg")
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copy(src, dst)
+        sheet_input = os.path.join(sheet_dir, "frame_%04d.jpg")
+    else:
+        sheet_input = os.path.join(job_dir, "frame_%04d.jpg")
+    _run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            sheet_input,
+            "-vf",
+            f"tile={cols}x{rows}:margin=4:padding=4,scale=1280:-1",
+            "-frames:v",
+            "1",
+            "-q:v",
+            "5",
+            os.path.join(job_dir, "contact.jpg"),
+            "-y",
+        ],
+        timeout=600,
+    )
+    if sheet_n < actual:
+        shutil.rmtree(os.path.join(job_dir, "sheet"), ignore_errors=True)
+
+    manifest.update(
+        {
+            "status": "done",
+            "frameCount": actual,
+            "finishedAt": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    _write_manifest(job_dir, manifest)
+    return manifest
+
+
 def _do_extract(job_id: str, req: ExtractRequest):
+    """YouTube flow: fetch metadata, download the video, extract frames."""
     job_dir = os.path.join(JOBS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
     manifest: dict = {
@@ -191,31 +345,13 @@ def _do_extract(job_id: str, req: ExtractRequest):
         vid = _video_id(req.url)
         if not vid:
             raise RuntimeError("That does not look like a YouTube URL.")
-        data = _ytdlp_json(req.url)
-        info = data
-        duration = float(info.get("duration") or 0)
-        if duration <= 0:
-            raise RuntimeError("Could not read the video length.")
-        if duration > MAX_DURATION_SEC:
-            raise RuntimeError(f"Video is too long ({duration:.0f}s). Max is {MAX_DURATION_SEC}s.")
-
-        start = min(req.startSec, duration - 1)
-        end = req.endSec if req.endSec > start else duration
-        clip = min(end - start, req.maxFrames / req.fps)
-        end = start + clip
-        frame_count = max(1, min(req.maxFrames, int(clip * req.fps)))
+        info = _ytdlp_json(req.url)
 
         manifest.update(
             {
                 "status": "downloading",
                 "title": info.get("title") or vid,
                 "videoId": vid,
-                "durationSec": round(duration, 1),
-                "clipStartSec": round(start, 1),
-                "clipEndSec": round(end, 1),
-                "fps": req.fps,
-                "frameCount": frame_count,
-                "width": req.width,
             }
         )
         _write_manifest(job_dir, manifest)
@@ -253,85 +389,21 @@ def _do_extract(job_id: str, req: ExtractRequest):
         if not downloaded:
             raise RuntimeError("Video download failed: " + dl_err)
 
-        manifest["status"] = "extracting"
-        _write_manifest(job_dir, manifest)
-
-        p = _run(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-ss",
-                str(start),
-                "-i",
-                video_path,
-                "-t",
-                str(clip),
-                "-vf",
-                f"fps={req.fps},scale={req.width}:-1",
-                "-frames:v",
-                str(frame_count),
-                "-q:v",
-                "4",
-                os.path.join(job_dir, "frame_%04d.jpg"),
-                "-y",
-            ],
-            timeout=1500,
-        )
-        # The video file is no longer needed; frames are what we keep.
-        try:
-            os.remove(video_path)
-        except OSError:
-            pass
-        if p.returncode != 0:
-            raise RuntimeError(
-                "Frame extraction failed: " + (p.stderr.strip()[-300:] or "ffmpeg error")
-            )
-
-        actual = len([f for f in os.listdir(job_dir) if re.fullmatch(r"frame_\d+\.jpg", f)])
-        if actual == 0:
-            raise RuntimeError("No frames came out. The stream may have expired; try again.")
-
-        # Contact sheet: 6 columns, keeps the agent's round trips low.
-        cols = 6
-        rows = max(1, (actual + cols - 1) // cols)
-        _run(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                os.path.join(job_dir, "frame_%04d.jpg"),
-                "-vf",
-                f"tile={cols}x{rows}:margin=4:padding=4,scale=1280:-1",
-                "-frames:v",
-                "1",
-                "-q:v",
-                "5",
-                os.path.join(job_dir, "contact.jpg"),
-                "-y",
-            ],
-            timeout=600,
+        _extract_frames_from_file(
+            job_dir, manifest, video_path,
+            info.get("title") or vid,
+            req.fps, req.maxFrames, req.width, req.startSec, req.endSec,
         )
 
         subs = _subtitles_text(info)
         if subs:
             with open(os.path.join(job_dir, "subtitles.txt"), "w") as f:
                 f.write(subs)
-
-        manifest.update(
-            {
-                "status": "done",
-                "frameCount": actual,
-                "hasSubtitles": bool(subs),
-                "finishedAt": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+            manifest["hasSubtitles"] = True
+            _write_manifest(job_dir, manifest)
     except Exception as e:
         manifest.update({"status": "failed", "error": str(e)[:400]})
-    _write_manifest(job_dir, manifest)
+        _write_manifest(job_dir, manifest)
 
 
 def _sweep():
@@ -385,6 +457,116 @@ def _run_job(job_id: str, req: ExtractRequest):
         _extract_lock.release()
 
 
+def _run_upload_job(
+    job_id: str,
+    video_path: str,
+    title: str,
+    fps: float,
+    max_frames: int,
+    width: int,
+    start_sec: float,
+    end_sec: float,
+):
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    manifest: dict = {
+        "id": job_id,
+        "status": "working",
+        "source": "upload",
+        "title": title,
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_manifest(job_dir, manifest)
+    try:
+        _extract_frames_from_file(
+            job_dir, manifest, video_path, title,
+            fps, max_frames, width, start_sec, end_sec,
+        )
+    except Exception as e:
+        manifest.update({"status": "failed", "error": str(e)[:400]})
+        _write_manifest(job_dir, manifest)
+    finally:
+        _extract_lock.release()
+
+
+@app.post("/api/upload-token")
+def upload_token(x_service_key: str | None = Header(default=None)):
+    """One-time token so Joel's browser can upload a video file directly
+    to this service (bypassing Vercel's 4.5MB body limit)."""
+    _check_key(x_service_key)
+    token = uuid.uuid4().hex
+    _upload_tokens[token] = time.time() + UPLOAD_TOKEN_TTL
+    # prune expired
+    now = time.time()
+    for t in [t for t, exp in _upload_tokens.items() if exp < now]:
+        del _upload_tokens[t]
+    return {"ok": True, "token": token, "expiresInSec": UPLOAD_TOKEN_TTL}
+
+
+@app.post("/api/upload")
+async def upload_video(
+    token: str = Form(...),
+    file: UploadFile = File(...),
+    fps: float = Form(1.0),
+    maxFrames: int = Form(600),
+    width: int = Form(640),
+    startSec: float = Form(0),
+    endSec: float = Form(0),
+):
+    """Direct video file upload. Joel downloads the video himself (his
+    network isn't blocked), the service slices it into frames."""
+    exp = _upload_tokens.pop(token, 0)
+    if exp < time.time():
+        raise HTTPException(status_code=401, detail="Bad or expired upload token.")
+    fps = min(5.0, max(0.25, fps))
+    maxFrames = min(MAX_FRAMES, max(10, maxFrames))
+    width = min(854, max(320, width))
+    startSec = max(0, startSec)
+    endSec = max(0, endSec)
+
+    if not _extract_lock.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="Another extraction is running. Try again in a minute.")
+
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"):
+        _extract_lock.release()
+        raise HTTPException(status_code=400, detail="That file type is not supported. Use mp4, mov, or webm.")
+    video_path = os.path.join(job_dir, "video" + ext)
+    try:
+        size = 0
+        with open(video_path, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="Video is too big (max 200MB).")
+                f.write(chunk)
+    except HTTPException:
+        _extract_lock.release()
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+    title = os.path.splitext(file.filename or "upload")[0][:120] or "upload"
+
+    t = threading.Thread(
+        target=_run_upload_job,
+        args=(job_id, video_path, title, fps, maxFrames, width, startSec, endSec),
+        daemon=True,
+    )
+    t.start()
+    base = os.environ.get("PUBLIC_BASE", "").rstrip("/")
+    return {
+        "ok": True,
+        "jobId": job_id,
+        "statusUrl": f"{base}/api/jobs/{job_id}",
+        "note": "Poll statusUrl until status is done, then fetch frames.",
+    }
+
+
 def _job_or_404(job_id: str) -> tuple[str, dict]:
     if not re.fullmatch(r"[0-9a-f]{12}", job_id or ""):
         raise HTTPException(status_code=404, detail="Job not found.")
@@ -403,6 +585,26 @@ def _public_manifest(job_id: str, m: dict) -> dict:
     if os.path.isfile(os.path.join(JOBS_DIR, job_id, "contact.jpg")):
         out["contactSheetUrl"] = f"{base}/v/{job_id}/contact.jpg"
     return out
+
+
+@app.get("/api/jobs")
+def list_jobs(x_service_key: str | None = Header(default=None)):
+    """Recent jobs, newest first. Lets the agent find Joel's latest upload."""
+    _check_key(x_service_key)
+    jobs = []
+    try:
+        entries = sorted(
+            os.listdir(JOBS_DIR),
+            key=lambda j: os.path.getmtime(os.path.join(JOBS_DIR, j)),
+            reverse=True,
+        )
+    except FileNotFoundError:
+        entries = []
+    for jid in entries[:20]:
+        m = _read_manifest(os.path.join(JOBS_DIR, jid))
+        if m:
+            jobs.append(_public_manifest(jid, m))
+    return {"ok": True, "jobs": jobs}
 
 
 @app.get("/api/jobs/{job_id}")
